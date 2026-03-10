@@ -35,7 +35,7 @@ MANAGERS = {
     "Астана": ["Камилла", "Еркежан", "Багнур", "Дилара", "Жансерик"],
     "Алматы": [],  # пустой список → ввод текстом
 }
-SHIFTS = ["8:00-16:30", "16:30-01:00"]
+SHIFTS = ["8:00-16:30", "16:30-01:00", "8:00-01:00"]
 
 # ============================================================
 # 💳  ШАГИ ОПЛАТЫ
@@ -150,6 +150,7 @@ def managers_kb(city: str):
     if not names:
         return cancel_kb
     rows = [names[i:i+3] for i in range(0, len(names), 3)]
+    rows.append(["✏️ Другой менеджер"])
     rows.append(["❌ Отмена"])
     return kb(*rows)
 
@@ -300,6 +301,9 @@ async def step_name(msg: types.Message, state: FSMContext):
     name = msg.text.strip()
     if name == "❌ Отмена":
         await cancel(msg, state)
+        return
+    if name == "✏️ Другой менеджер":
+        await msg.answer("✏️ Введите имя менеджера:", reply_markup=cancel_kb)
         return
     if not name:
         await msg.answer("❌ Введите имя:")
@@ -461,7 +465,7 @@ async def _show_confirm(msg: types.Message, state: FSMContext):
         if v > 0:
             lines.append(f"  {label}: {v:,}₸")
 
-    conv = round(data["orders"] / data["leads"], 1) if data["leads"] > 0 else 0
+    conv = round(data["orders"] / data["leads"] * 100, 1) if data["leads"] > 0 else 0
 
     text = (
         f"📋 *Шаг 7/7 — Проверьте данные:*\n\n"
@@ -504,7 +508,7 @@ async def step_confirm(msg: types.Message, state: FSMContext):
 
         try:
             total = write_manager_report(entry, data["city"])
-            conv  = round(data["orders"] / data["leads"], 1) if data["leads"] > 0 else 0
+            conv  = round(data["orders"] / data["leads"] * 100, 1) if data["leads"] > 0 else 0
             await msg.answer(
                 f"✅ *Записано!*\n\n"
                 f"📍 {data['city']}  |  👤 {data['name']}\n"
