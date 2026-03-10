@@ -23,8 +23,8 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 # ⚙️  НАСТРОЙКИ
 # ============================================================
 BOT_TOKEN           = os.getenv("BOT_TOKEN",           "ВСТАВЬТЕ_ТОКЕН_БОТА")
-SPREADSHEET_ASTANA  = os.getenv("SPREADSHEET_ASTANA",  "ВСТАВЬТЕ_ID_ТАБЛИЦЫ_АСТАНА")
-SPREADSHEET_ALMATY  = os.getenv("SPREADSHEET_ALMATY",  "ВСТАВЬТЕ_ID_ТАБЛИЦЫ_АЛМАТЫ")
+SPREADSHEET_ASTANA  = os.getenv("SPREADSHEET_ASTANA",  "1MkzKzmNLKfxI5OaXJnzh03LhcHMYNbz0zAHaCfb80WA")
+SPREADSHEET_ALMATY  = os.getenv("SPREADSHEET_ALMATY",  "1yNuArFAE9UkEHilVZDHd4LyY6070xz8KBA7dojZMLGI")
 CREDENTIALS_FILE    = "credentials.json"
 ALLOWED_USERS: list[int] = []   # пусто = доступ для всех
 
