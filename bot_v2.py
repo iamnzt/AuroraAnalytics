@@ -1,7 +1,7 @@
 """
-🌸 Flower Dashboard — Telegram Bot v3.0
-Раздельные таблицы для Астаны и Алматы.
-Парсит РЕАЛЬНЫЙ формат отчётов из WhatsApp.
+🌸 Flower Dashboard — Telegram Bot v4.0
+Пошаговый ввод отчёта менеджера через кнопки.
+Расходы убраны (есть отдельные боты «Чеки»).
 """
 
 import re
@@ -9,7 +9,7 @@ import logging
 import asyncio
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -20,340 +20,615 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 # ============================================================
-# ⚙️ НАСТРОЙКИ
+# ⚙️  НАСТРОЙКИ
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_БОТА_СЮДА")
-SPREADSHEET_ASTANA = os.getenv("SPREADSHEET_ASTANA", "ВСТАВЬТЕ_ID_ТАБЛИЦЫ_АСТАНА")
-SPREADSHEET_ALMATY = os.getenv("SPREADSHEET_ALMATY", "ВСТАВЬТЕ_ID_ТАБЛИЦЫ_АЛМАТЫ")
-CREDENTIALS_FILE = "credentials.json"
-ALLOWED_USERS = []
+BOT_TOKEN           = os.getenv("BOT_TOKEN",           "ВСТАВЬТЕ_ТОКЕН_БОТА")
+SPREADSHEET_ASTANA  = os.getenv("SPREADSHEET_ASTANA",  "ВСТАВЬТЕ_ID_ТАБЛИЦЫ_АСТАНА")
+SPREADSHEET_ALMATY  = os.getenv("SPREADSHEET_ALMATY",  "ВСТАВЬТЕ_ID_ТАБЛИЦЫ_АЛМАТЫ")
+CREDENTIALS_FILE    = "credentials.json"
+ALLOWED_USERS: list[int] = []   # пусто = доступ для всех
 
 # ============================================================
-# Google Sheets
+# 👤  МЕНЕДЖЕРЫ И СМЕНЫ
 # ============================================================
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-
-_client = None
-def get_client():
-    global _client
-    if _client is None:
-        google_creds_json = os.getenv("GOOGLE_CREDENTIALS")
-        if google_creds_json:
-            creds_dict = json.loads(google_creds_json)
-            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-        else:
-            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
-        _client = gspread.authorize(creds)
-    return _client
-
-def get_sheet(city: str):
-    client = get_client()
-    sheet_id = SPREADSHEET_ASTANA if city == "Астана" else SPREADSHEET_ALMATY
-    return client.open_by_key(sheet_id)
+MANAGERS = {
+    "Астана": ["Камилла", "Еркежан", "Багнур", "Дилара", "Жансерик"],
+    "Алматы": [],  # пустой список → ввод текстом
+}
+SHIFTS = ["8:00-16:30", "16:30-01:00"]
 
 # ============================================================
-# ПАРСЕР ЧИСЕЛ
+# 💳  ШАГИ ОПЛАТЫ
 # ============================================================
+PAYMENT_STEPS = [
+    ("kaspi_pay",      "💳 Каспи Пей"),
+    ("kaspi_red",      "🔴 Каспи Ред"),
+    ("cash",           "💵 Наличные"),
+    ("halyk_terminal", "🏦 Халык терминал"),
+    ("halyk_transfer", "📲 Халык перевод"),
+    ("jusan",          "📱 Жусан"),
+    ("kaspi_transfer", "🔄 Каспи перевод"),
+    ("bcc",            "🏛 БЦК"),
+    ("freedom",        "🆓 Фридом"),
+    ("forte",          "💪 Форте"),
+    ("international",  "🌍 Межд. карта"),
+    ("other",          "❓ Другое"),
+    ("surcharge",      "➕ Доплаты"),
+    ("returns",        "↩️ Возвраты"),
+]
+PAYMENT_COLS = [p[0] for p in PAYMENT_STEPS]
 
+# ============================================================
+# 🔢  ПАРСЕР ЧИСЕЛ  (144.890 → 144890, 792 300 → 792300)
+# ============================================================
 def parse_number(text: str) -> int:
-    """
-    Парсит число. Поддерживает:
-    792 300 → 792300, 144.890 → 144890, 1.110.798 → 1110798
-    """
-    text = text.strip().replace(' ', '')
-    if '.' in text:
-        text = text.replace('.', '')
-    text = re.sub(r'[^\d-]', '', text)
+    text = text.strip().replace(" ", "")
+    if "." in text:
+        text = text.replace(".", "")
+    text = re.sub(r"[^\d-]", "", text)
     try:
         return int(text)
     except ValueError:
         return 0
 
 # ============================================================
-# МАППИНГ КЛЮЧЕВЫХ СЛОВ
+# 🗂️  GOOGLE SHEETS
 # ============================================================
-
-KEY_MAPPINGS = [
-    ('приход', 'leads'), ('лиды', 'leads'),
-    ('оформлены', 'orders'), ('оформленные', 'orders'), ('оформлено', 'orders'),
-    ('халык терминал', 'halyk_terminal'), ('халык перевод', 'halyk_transfer'),
-    ('дана пей', 'other'), ('kaspi pay', 'kaspi_pay'), ('каспи пей', 'kaspi_pay'),
-    ('пей', 'kaspi_pay'), ('kaspi red', 'kaspi_red'), ('каспи ред', 'kaspi_red'),
-    ('ред', 'kaspi_red'), ('наличные', 'cash'), ('наличка', 'cash'), ('нал', 'cash'),
-    ('халык', 'halyk_terminal'), ('жусан', 'jusan'),
-    ('каспи перевод', 'kaspi_transfer'), ('перевод/иин', 'kaspi_transfer'),
-    ('перевод', 'kaspi_transfer'), ('бцк', 'bcc'), ('фридом', 'freedom'),
-    ('форте', 'forte'), ('международный', 'international'), ('другое', 'other'),
-    ('доплаты', 'surcharge'), ('доплата', 'surcharge'),
-    ('возвраты', 'returns'), ('возврат', 'returns'),
-    ('общая с доплатами', 'total_with_surcharge'),
-    ('за смену', 'total_with_surcharge'),
-    ('общий', 'total_basic'), ('общая', 'total_basic'), ('итого', 'total_basic'),
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
+_client = None
 
-PAYMENT_COLS = ['kaspi_pay','kaspi_red','cash','halyk_terminal','halyk_transfer',
-    'jusan','kaspi_transfer','bcc','freedom','forte','international','other','surcharge','returns']
+def get_client():
+    global _client
+    if _client is None:
+        raw = os.getenv("GOOGLE_CREDENTIALS")
+        if raw:
+            creds = Credentials.from_service_account_info(json.loads(raw), scopes=SCOPES)
+        else:
+            creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+        _client = gspread.authorize(creds)
+    return _client
 
-# ============================================================
-# ПАРСЕР ОТЧЁТА МЕНЕДЖЕРА
-# ============================================================
+def get_sheet(city: str):
+    sid = SPREADSHEET_ASTANA if city == "Астана" else SPREADSHEET_ALMATY
+    return get_client().open_by_key(sid)
 
-def parse_manager_report(text: str) -> list[dict]:
-    """Парсит отчёт менеджера — многострочный формат из WhatsApp"""
-    lines = text.strip().split('\n')
-    lines = [l.strip() for l in lines]
+# ---------- запись ----------
 
-    entry = {k: 0 for k in PAYMENT_COLS}
-    entry.update({'date': datetime.now().strftime('%d.%m.%Y'), 'name': '', 'shift': '',
-                  'leads': 0, 'orders': 0, 'total_basic': 0, 'total_with_surcharge': 0})
+def write_manager_report(entry: dict, city: str) -> int:
+    """Пишет строку в лист 'Продажи', возвращает итого."""
+    ws = get_sheet(city).worksheet("Продажи")
+    pay_sum  = sum(entry.get(c, 0) for c in PAYMENT_COLS[:12])
+    surcharge = entry.get("surcharge", 0)
+    returns   = entry.get("returns",   0)
+    total = pay_sum + surcharge - returns
+    conv  = round(entry["orders"] / entry["leads"], 3) if entry["leads"] > 0 else 0
+    row = [entry["date"], entry["name"], entry["shift"],
+           entry["leads"], entry["orders"]]
+    row += [entry.get(c, 0) for c in PAYMENT_COLS]
+    row += [total, conv]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    return total
 
-    shift_pat = re.compile(r'^(\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})$')
-
-    for line in lines:
-        if not line:
-            continue
-
-        # 1. Смена: 18:30-1:00 (проверяем ПЕРВЫМ — содержит двоеточие!)
-        if shift_pat.match(line):
-            entry['shift'] = line
-            continue
-
-        # 2. Имя: одно слово кириллицей
-        if re.match(r'^[А-ЯЁа-яё]+$', line) and not entry['name']:
-            entry['name'] = line
-            continue
-
-        # 3. "За смену 2.663.298" (без двоеточия)
-        za = re.match(r'^за\s+смену\s+(.+)$', line, re.IGNORECASE)
-        if za:
-            entry['total_with_surcharge'] = parse_number(za.group(1))
-            continue
-
-        # 4. Строка с двоеточием: ключ : значение
-        kv = re.match(r'^(.+?)\s*:\s*(.+)$', line)
-        if kv:
-            key = kv.group(1).strip().lower()
-            val = parse_number(kv.group(2))
-            matched = False
-            for keyword, column in KEY_MAPPINGS:
-                if keyword in key:
-                    if column == 'leads': entry['leads'] = val
-                    elif column == 'orders': entry['orders'] = val
-                    elif column == 'total_basic': entry['total_basic'] = val
-                    elif column == 'total_with_surcharge': entry['total_with_surcharge'] = val
-                    elif column in PAYMENT_COLS: entry[column] += val
-                    matched = True
-                    break
-            if not matched and val > 0:
-                entry['other'] += val
-            continue
-
-    if not entry['name']:
-        entry['name'] = 'Неизвестно'
-
-    return [entry]
-
-
-def parse_schedule(text: str, role: str) -> list[dict]:
-    results = []
-    current_date = None
-    for line in text.strip().split('\n'):
-        line = line.strip()
-        if not line: continue
-        if re.match(r'^\d{1,2}\.\d{1,2}(?:\.\d{2,4})?$', line) and len(line) <= 10:
-            current_date = line
-            if len(current_date.split('.')) == 2:
-                current_date += f'.{datetime.now().year}'
-            continue
-        if current_date:
-            shift_type = 'Полная'
-            name = line
-            if any(x in line.lower() for x in ['пол-смены','пол смены','половина']):
-                shift_type = 'Пол-смены'
-                name = re.sub(r'\s*(пол-смены|пол смены|половина)\s*', '', line, flags=re.IGNORECASE).strip()
-            if name:
-                e = {'date': current_date, 'name': name.strip(), 'role': role}
-                if role == 'Логист': e['shift_type'] = shift_type
-                results.append(e)
-    return results
-
-# ============================================================
-# Запись в Google Sheets
-# ============================================================
-
-def write_manager_report(entries: list[dict], city: str) -> int:
-    ws = get_sheet(city).worksheet('Продажи')
-    rows = []
-    for e in entries:
-        payments_sum = sum(e.get(c, 0) for c in PAYMENT_COLS[:12])
-        total = e.get('total_with_surcharge', 0) or e.get('total_basic', 0) or (payments_sum + e.get('surcharge',0) - e.get('returns',0))
-        row = [e['date'], e['name'], e['shift'], e['leads'], e['orders']]
-        row.extend([e.get(c, 0) for c in PAYMENT_COLS])
-        row.append(total)
-        row.append(round(e['orders']/e['leads'], 3) if e['leads'] > 0 else 0)
-        rows.append(row)
+def write_schedule(entries: list[dict], city: str, role: str) -> int:
+    sheet_name = "Смены флористов" if role == "Флорист" else "Смены логистов"
+    ws = get_sheet(city).worksheet(sheet_name)
+    if role == "Логист":
+        rows = [[e["date"], e["name"], e.get("shift_type", "Полная")] for e in entries]
+    else:
+        rows = [[e["date"], e["name"]] for e in entries]
     if rows:
-        ws.append_rows(rows, value_input_option='USER_ENTERED')
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
     return len(rows)
-
-def write_florist_schedule(entries, city):
-    ws = get_sheet(city).worksheet('Смены флористов')
-    rows = [[e['date'], e['name']] for e in entries]
-    if rows: ws.append_rows(rows, value_input_option='USER_ENTERED')
-    return len(rows)
-
-def write_logist_schedule(entries, city):
-    ws = get_sheet(city).worksheet('Смены логистов')
-    rows = [[e['date'], e['name'], e.get('shift_type','Полная')] for e in entries]
-    if rows: ws.append_rows(rows, value_input_option='USER_ENTERED')
-    return len(rows)
-
-def write_expense(date, name, amount, city):
-    get_sheet(city).worksheet('Расходы').append_row([date, name, amount, ''], value_input_option='USER_ENTERED')
 
 def write_marketing(date, lp, l, sp, sl, rt, city):
-    get_sheet(city).worksheet('Маркетинг').append_row([date,lp,l,'',sp,'',sl,'','','',rt,'',''], value_input_option='USER_ENTERED')
+    get_sheet(city).worksheet("Маркетинг").append_row(
+        [date, lp, l, "", sp, "", sl, "", "", "", rt, "", ""],
+        value_input_option="USER_ENTERED",
+    )
 
 # ============================================================
-# Telegram Bot
+# ⌨️  КЛАВИАТУРЫ
+# ============================================================
+def kb(*rows):
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+    )
+
+main_kb   = kb(["📊 Отчёт менеджера", "🌺 Смены флористов"],
+               ["🚗 Смены логистов",  "🎯 Маркетинг"],
+               ["📋 Помощь"])
+city_kb   = kb(["🏙 Астана", "🏔 Алматы"], ["❌ Отмена"])
+cancel_kb = kb(["❌ Отмена"])
+skip_kb   = kb(["0 — пропустить"], ["❌ Отмена"])
+
+def managers_kb(city: str):
+    names = MANAGERS.get(city, [])
+    if not names:
+        return cancel_kb
+    rows = [names[i:i+3] for i in range(0, len(names), 3)]
+    rows.append(["❌ Отмена"])
+    return kb(*rows)
+
+shifts_kb = kb(SHIFTS, ["❌ Отмена"])
+
+def dates_kb():
+    today = datetime.now().strftime("%d.%m.%Y")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
+    return kb([f"📅 Сегодня ({today})", f"📅 Вчера ({yesterday})"],
+              ["✏️ Другая дата"], ["❌ Отмена"])
+
+confirm_kb = kb(["✅ Записать", "🔄 Начать заново"], ["❌ Отмена"])
+
+# ============================================================
+# 🤖  FSM СОСТОЯНИЯ
+# ============================================================
+class S(StatesGroup):
+    # Общий шаг выбора города
+    city = State()
+    # Отчёт менеджера — пошагово
+    m_name        = State()
+    m_shift       = State()
+    m_date        = State()
+    m_date_custom = State()
+    m_leads       = State()
+    m_orders      = State()
+    m_payment     = State()   # итерация по PAYMENT_STEPS через pay_index
+    m_confirm     = State()
+    # Текстовые сценарии (флористы, логисты, маркетинг)
+    text_input    = State()
+
+# ============================================================
+# 🚀  БОТ
 # ============================================================
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp  = Dispatcher()
 
-class States(StatesGroup):
-    choosing_city = State()
-    waiting_report = State()
-
-main_kb = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text="📊 Отчёт менеджера"), KeyboardButton(text="🌺 Смены флористов")],
-    [KeyboardButton(text="🚗 Смены логистов"), KeyboardButton(text="💰 Расход")],
-    [KeyboardButton(text="🎯 Маркетинг"), KeyboardButton(text="📋 Помощь")],
-], resize_keyboard=True)
-city_kb = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text="🏙 Астана"), KeyboardButton(text="🏔 Алматы")],
-    [KeyboardButton(text="❌ Отмена")],
-], resize_keyboard=True)
-cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True)
-
-def check_access(uid):
+def check_access(uid: int) -> bool:
     return not ALLOWED_USERS or uid in ALLOWED_USERS
 
+# ---------- /start ----------
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message, state: FSMContext):
-    if not check_access(msg.from_user.id): return
+    if not check_access(msg.from_user.id):
+        return
     await state.clear()
-    await msg.answer("🌸 *Flower Dashboard Bot v3*\n\n📊 Отчёт менеджера\n🌺 Флористы\n🚗 Логисты\n💰 Расход\n🎯 Маркетинг", parse_mode="Markdown", reply_markup=main_kb)
+    await msg.answer(
+        "🌸 *Flower Dashboard Bot v4*\n\nВыберите действие:",
+        parse_mode="Markdown",
+        reply_markup=main_kb,
+    )
 
+# ---------- Отмена ----------
 @dp.message(F.text == "❌ Отмена")
 async def cancel(msg: types.Message, state: FSMContext):
     await state.clear()
     await msg.answer("Отменено.", reply_markup=main_kb)
 
-REPORT_TYPES = {"📊 Отчёт менеджера":"manager", "🌺 Смены флористов":"florist", "🚗 Смены логистов":"logist", "💰 Расход":"expense", "🎯 Маркетинг":"marketing"}
-
-@dp.message(F.text.in_(REPORT_TYPES.keys()))
-async def choose_report(msg: types.Message, state: FSMContext):
-    if not check_access(msg.from_user.id): return
-    await state.set_state(States.choosing_city)
-    await state.update_data(report_type=REPORT_TYPES[msg.text])
-    await msg.answer("Выберите город:", reply_markup=city_kb)
-
+# ---------- Помощь ----------
 @dp.message(F.text == "📋 Помощь")
 async def help_cmd(msg: types.Message):
-    await msg.answer("📊 Менеджер — скопируйте из WhatsApp как есть\n🌺 Флористы — даты+имена\n🚗 Логисты — даты+имена\n💰 Расход — `название сумма`\n🎯 Маркетинг — `дата план факт $ продаж курс`\n\n✅ Точки в числах (144.890) — понимает\n✅ Пробелы в числах (792 300) — понимает", parse_mode="Markdown", reply_markup=main_kb)
+    await msg.answer(
+        "📊 *Отчёт менеджера* — пошаговый ввод через кнопки\n"
+        "🌺 *Флористы* — текстом: дата, затем имена\n"
+        "🚗 *Логисты* — текстом: дата, затем имена\n"
+        "🎯 *Маркетинг* — `дата план факт $ продаж курс`\n\n"
+        "✅ Числа с точками (144.890 = 144 890) — понимает\n"
+        "✅ Числа с пробелами (792 300) — понимает",
+        parse_mode="Markdown",
+        reply_markup=main_kb,
+    )
 
-@dp.message(States.choosing_city, F.text.in_(["🏙 Астана", "🏔 Алматы"]))
-async def select_city(msg: types.Message, state: FSMContext):
-    city = "Астана" if "Астана" in msg.text else "Алматы"
-    data = await state.get_data()
-    await state.update_data(city=city)
-    await state.set_state(States.waiting_report)
-    hints = {
-        'manager': f"📊 *{city}*\n\nСкопируйте отчёт из WhatsApp как есть.\nДата запишется автоматически (сегодня).\nТочки в числах — ок.",
-        'florist': f"🌺 *{city}*\nОтправьте расписание (даты+имена)",
-        'logist': f"🚗 *{city}*\nОтправьте расписание (даты+имена)",
-        'expense': f"💰 *{city}*\nФормат: `название сумма`",
-        'marketing': f"🎯 *{city}*\nФормат: `дата план факт $ продаж курс`",
-    }
-    await msg.answer(hints.get(data['report_type'], "Отправьте данные:"), parse_mode="Markdown", reply_markup=cancel_kb)
-
-@dp.message(States.waiting_report)
-async def process_report(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    rt, city = data['report_type'], data['city']
-    text = msg.text
-    if not text: await msg.answer("❌ Отправьте текст"); return
-
-    try:
-        if rt == 'manager':
-            entries = parse_manager_report(text)
-            if not entries: await msg.answer("❌ Не распознано."); return
-            count = write_manager_report(entries, city)
-            for e in entries:
-                total = e.get('total_with_surcharge',0) or e.get('total_basic',0) or sum(e.get(k,0) for k in PAYMENT_COLS[:12])
-                await msg.answer(
-                    f"✅ Записано!\n📍 {city}\n\n"
-                    f"👤 {e['name']} ({e['shift']})\n"
-                    f"👥 Лиды: {e['leads']} → Продажи: {e['orders']}\n\n"
-                    f"💳 Пей: {e.get('kaspi_pay',0):,}\n"
-                    f"💳 Ред: {e.get('kaspi_red',0):,}\n"
-                    f"💵 Нал: {e.get('cash',0):,}\n"
-                    f"🏦 Халык: {e.get('halyk_terminal',0):,}\n"
-                    f"📲 Перевод: {e.get('kaspi_transfer',0):,}\n"
-                    f"📱 Другое: {e.get('other',0):,}\n\n"
-                    f"💰 ИТОГО: {total:,}₸",
-                    reply_markup=main_kb)
-
-        elif rt == 'florist':
-            entries = parse_schedule(text, 'Флорист')
-            if not entries: await msg.answer("❌ Не распознано."); return
-            count = write_florist_schedule(entries, city)
-            dates = sorted(set(e['date'] for e in entries))
-            names = sorted(set(e['name'] for e in entries))
-            await msg.answer(f"✅ {count} смен!\n📍 {city}\n📅 {dates[0]}—{dates[-1]}\n👤 {', '.join(names)}", reply_markup=main_kb)
-
-        elif rt == 'logist':
-            entries = parse_schedule(text, 'Логист')
-            if not entries: await msg.answer("❌ Не распознано."); return
-            count = write_logist_schedule(entries, city)
-            dates = sorted(set(e['date'] for e in entries))
-            names = sorted(set(e['name'] for e in entries))
-            half = sum(1 for e in entries if e.get('shift_type')=='Пол-смены')
-            await msg.answer(f"✅ {count} смен!\n📍 {city}\n📅 {dates[0]}—{dates[-1]}\n👤 {', '.join(names)}" + (f"\n⚡ Пол-смен: {half}" if half else ""), reply_markup=main_kb)
-
-        elif rt == 'expense':
-            m = re.match(r'(.+?)\s+(\d[\d\s.]*)', text.strip())
-            if not m: await msg.answer("❌ Формат: `название сумма`", parse_mode="Markdown"); return
-            name, amount = m.group(1).strip(), parse_number(m.group(2))
-            write_expense(datetime.now().strftime('%d.%m.%Y'), name, amount, city)
-            await msg.answer(f"✅ Расход: {name} — {amount:,}₸\n📍 {city}", reply_markup=main_kb)
-
-        elif rt == 'marketing':
-            count = 0
-            for line in text.strip().split('\n'):
-                p = line.strip().split()
-                if len(p) < 6: continue
-                d = p[0]
-                if len(d.split('.')) == 2: d += f'.{datetime.now().year}'
-                try:
-                    write_marketing(d, int(p[1]), int(p[2]), float(p[3]), int(p[4]), float(p[5].replace(',','.')), city)
-                    count += 1
-                except: continue
-            if not count: await msg.answer("❌ Формат: `дата план факт $ продаж курс`", parse_mode="Markdown"); return
-            await msg.answer(f"✅ {count} строк!\n📍 {city}", reply_markup=main_kb)
-
-    except Exception as e:
-        logging.error(f"Error: {e}", exc_info=True)
-        await msg.answer(f"❌ Ошибка: {str(e)}", reply_markup=main_kb)
-    await state.clear()
-
+# ---------- /myid ----------
 @dp.message(Command("myid"))
 async def cmd_myid(msg: types.Message):
     await msg.answer(f"ID: `{msg.from_user.id}`", parse_mode="Markdown")
 
+# ============================================================
+# ШАГИ ОТЧЁТА МЕНЕДЖЕРА
+# ============================================================
+
+ACTION_MAP = {
+    "📊 Отчёт менеджера": "manager",
+    "🌺 Смены флористов": "florist",
+    "🚗 Смены логистов":  "logist",
+    "🎯 Маркетинг":       "marketing",
+}
+
+@dp.message(F.text.in_(ACTION_MAP))
+async def choose_action(msg: types.Message, state: FSMContext):
+    if not check_access(msg.from_user.id):
+        return
+    await state.set_state(S.city)
+    await state.update_data(action=ACTION_MAP[msg.text])
+    await msg.answer("🏙 Выберите город:", reply_markup=city_kb)
+
+# --- Шаг 1: Город ---
+@dp.message(S.city, F.text.in_(["🏙 Астана", "🏔 Алматы"]))
+async def select_city(msg: types.Message, state: FSMContext):
+    city   = "Астана" if "Астана" in msg.text else "Алматы"
+    data   = await state.get_data()
+    action = data["action"]
+    await state.update_data(city=city)
+
+    if action == "manager":
+        await state.set_state(S.m_name)
+        managers = MANAGERS.get(city, [])
+        if managers:
+            await msg.answer(
+                f"👤 *Шаг 1/7* — Менеджер ({city}):",
+                parse_mode="Markdown",
+                reply_markup=managers_kb(city),
+            )
+        else:
+            await msg.answer(
+                f"👤 *Шаг 1/7* — Введите имя менеджера ({city}):",
+                parse_mode="Markdown",
+                reply_markup=cancel_kb,
+            )
+
+    elif action in ("florist", "logist"):
+        role = "Флорист" if action == "florist" else "Логист"
+        await state.update_data(role=role)
+        await state.set_state(S.text_input)
+        icon = "🌺" if action == "florist" else "🚗"
+        await msg.answer(
+            f"{icon} *{city}* — Смены {role.lower()}ов\n\n"
+            "Формат:\n`01.06\nИмя Фамилия\nДругое Имя`\n\n"
+            "_(пол-смены → допишите «пол-смены» после имени)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb,
+        )
+
+    elif action == "marketing":
+        await state.set_state(S.text_input)
+        await msg.answer(
+            f"🎯 *{city}* — Маркетинг\n\n"
+            "Формат: `дата план факт $ продаж курс`\n"
+            "Пример: `01.06 100 85 0.9 50 450`",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb,
+        )
+
+# --- Шаг 2: Имя менеджера ---
+@dp.message(S.m_name)
+async def step_name(msg: types.Message, state: FSMContext):
+    name = msg.text.strip()
+    if name == "❌ Отмена":
+        await cancel(msg, state)
+        return
+    if not name:
+        await msg.answer("❌ Введите имя:")
+        return
+    await state.update_data(name=name)
+    await state.set_state(S.m_shift)
+    await msg.answer(
+        f"✅ Менеджер: *{name}*\n\n⏰ *Шаг 2/7* — Выберите смену:",
+        parse_mode="Markdown",
+        reply_markup=shifts_kb,
+    )
+
+# --- Шаг 3: Смена ---
+@dp.message(S.m_shift, F.text.in_(SHIFTS))
+async def step_shift(msg: types.Message, state: FSMContext):
+    await state.update_data(shift=msg.text)
+    await state.set_state(S.m_date)
+    await msg.answer(
+        f"✅ Смена: *{msg.text}*\n\n📅 *Шаг 3/7* — Выберите дату:",
+        parse_mode="Markdown",
+        reply_markup=dates_kb(),
+    )
+
+# --- Шаг 4: Дата ---
+@dp.message(S.m_date)
+async def step_date(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if text == "❌ Отмена":
+        await cancel(msg, state)
+        return
+    if text == "✏️ Другая дата":
+        await state.set_state(S.m_date_custom)
+        await msg.answer("📅 Введите дату в формате ДД.ММ.ГГГГ:", reply_markup=cancel_kb)
+        return
+
+    if text.startswith("📅 Сегодня"):
+        date = datetime.now().strftime("%d.%m.%Y")
+    elif text.startswith("📅 Вчера"):
+        date = (datetime.now() - timedelta(days=1)).strftime("%d.%m.%Y")
+    else:
+        date = datetime.now().strftime("%d.%m.%Y")
+
+    await _after_date(msg, state, date)
+
+@dp.message(S.m_date_custom)
+async def step_date_custom(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if text == "❌ Отмена":
+        await cancel(msg, state)
+        return
+    if not re.match(r"^\d{1,2}\.\d{1,2}(\.\d{2,4})?$", text):
+        await msg.answer("❌ Формат: ДД.ММ.ГГГГ (например: 15.06.2025)")
+        return
+    if len(text.split(".")) == 2:
+        text += f".{datetime.now().year}"
+    await _after_date(msg, state, text)
+
+async def _after_date(msg, state, date: str):
+    await state.update_data(date=date)
+    await state.set_state(S.m_leads)
+    await msg.answer(
+        f"✅ Дата: *{date}*\n\n👥 *Шаг 4/7* — Введите количество *лидов* (приход):",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb,
+    )
+
+# --- Шаг 5: Лиды ---
+@dp.message(S.m_leads)
+async def step_leads(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if text == "❌ Отмена":
+        await cancel(msg, state)
+        return
+    n = parse_number(text)
+    if n <= 0:
+        await msg.answer("❌ Введите число больше 0:")
+        return
+    await state.update_data(leads=n)
+    await state.set_state(S.m_orders)
+    await msg.answer(
+        f"✅ Лиды: *{n}*\n\n🛍 *Шаг 5/7* — Введите количество *оформленных заказов*:",
+        parse_mode="Markdown",
+        reply_markup=cancel_kb,
+    )
+
+# --- Шаг 6: Оформленные ---
+@dp.message(S.m_orders)
+async def step_orders(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if text == "❌ Отмена":
+        await cancel(msg, state)
+        return
+    n = parse_number(text)
+    if n < 0:
+        await msg.answer("❌ Введите 0 или больше:")
+        return
+    # Инициализируем оплаты нулями и начинаем итерацию
+    await state.update_data(
+        orders=n,
+        pay_index=0,
+        payments={col: 0 for col, _ in PAYMENT_STEPS},
+    )
+    await state.set_state(S.m_payment)
+    await _ask_payment(msg, state)
+
+# --- Шаг 7: Оплаты (итерация) ---
+async def _ask_payment(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    idx  = data.get("pay_index", 0)
+
+    if idx >= len(PAYMENT_STEPS):
+        # Все оплаты введены → подтверждение
+        await state.set_state(S.m_confirm)
+        await _show_confirm(msg, state)
+        return
+
+    col, label = PAYMENT_STEPS[idx]
+    progress   = f"{idx + 1}/{len(PAYMENT_STEPS)}"
+    await msg.answer(
+        f"💰 *Шаг 6/7* — Оплаты [{progress}]\n\n*{label}*\n_(введите сумму или нажмите «0 — пропустить»)_",
+        parse_mode="Markdown",
+        reply_markup=skip_kb,
+    )
+
+@dp.message(S.m_payment)
+async def step_payment(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if text == "❌ Отмена":
+        await cancel(msg, state)
+        return
+
+    data = await state.get_data()
+    idx  = data.get("pay_index", 0)
+    col, label = PAYMENT_STEPS[idx]
+
+    amount = 0 if text == "0 — пропустить" else parse_number(text)
+    if amount < 0:
+        await msg.answer("❌ Введите 0 или положительное число:")
+        return
+
+    payments = data.get("payments", {})
+    payments[col] = amount
+    await state.update_data(payments=payments, pay_index=idx + 1)
+    await _ask_payment(msg, state)
+
+# --- Шаг 8: Подтверждение ---
+async def _show_confirm(msg: types.Message, state: FSMContext):
+    data     = await state.get_data()
+    payments = data.get("payments", {})
+
+    pay_sum   = sum(payments.get(c, 0) for c in PAYMENT_COLS[:12])
+    surcharge = payments.get("surcharge", 0)
+    returns   = payments.get("returns",   0)
+    total     = pay_sum + surcharge - returns
+
+    lines = []
+    for col, label in PAYMENT_STEPS:
+        v = payments.get(col, 0)
+        if v > 0:
+            lines.append(f"  {label}: {v:,}₸")
+
+    conv = round(data["orders"] / data["leads"], 1) if data["leads"] > 0 else 0
+
+    text = (
+        f"📋 *Шаг 7/7 — Проверьте данные:*\n\n"
+        f"📍 {data['city']}\n"
+        f"👤 {data['name']}\n"
+        f"⏰ {data['shift']}\n"
+        f"📅 {data['date']}\n\n"
+        f"👥 Лиды: *{data['leads']}*   |   Продажи: *{data['orders']}*   |   Конверсия: *{conv}%*\n"
+    )
+    if lines:
+        text += "\n💳 *Оплаты:*\n" + "\n".join(lines)
+    text += f"\n\n💰 *ИТОГО: {total:,}₸*"
+
+    await msg.answer(text, parse_mode="Markdown", reply_markup=confirm_kb)
+
+@dp.message(S.m_confirm)
+async def step_confirm(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+
+    if text == "❌ Отмена":
+        await cancel(msg, state)
+        return
+
+    if text == "🔄 Начать заново":
+        await state.clear()
+        await msg.answer("🔄 Начнём заново.", reply_markup=main_kb)
+        return
+
+    if text == "✅ Записать":
+        data     = await state.get_data()
+        payments = data.get("payments", {})
+        entry    = {
+            "date":   data["date"],
+            "name":   data["name"],
+            "shift":  data["shift"],
+            "leads":  data["leads"],
+            "orders": data["orders"],
+        }
+        entry.update(payments)
+
+        try:
+            total = write_manager_report(entry, data["city"])
+            conv  = round(data["orders"] / data["leads"], 1) if data["leads"] > 0 else 0
+            await msg.answer(
+                f"✅ *Записано!*\n\n"
+                f"📍 {data['city']}  |  👤 {data['name']}\n"
+                f"⏰ {data['shift']}  |  📅 {data['date']}\n\n"
+                f"👥 {data['leads']} лидов → {data['orders']} продаж ({conv}%)\n"
+                f"💰 *{total:,}₸*",
+                parse_mode="Markdown",
+                reply_markup=main_kb,
+            )
+        except Exception as e:
+            logging.error(f"Write error: {e}", exc_info=True)
+            await msg.answer(f"❌ Ошибка записи: {e}", reply_markup=main_kb)
+
+        await state.clear()
+        return
+
+    await msg.answer("Нажмите ✅ Записать, 🔄 Начать заново или ❌ Отмена")
+
+# ============================================================
+# ТЕКСТОВЫЕ СЦЕНАРИИ (флористы, логисты, маркетинг)
+# ============================================================
+
+def parse_schedule(text: str, role: str) -> list[dict]:
+    results, current_date = [], None
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^\d{1,2}\.\d{1,2}(?:\.\d{2,4})?$", line) and len(line) <= 10:
+            current_date = line
+            if len(current_date.split(".")) == 2:
+                current_date += f".{datetime.now().year}"
+            continue
+        if current_date:
+            shift_type = "Полная"
+            name = line
+            if any(x in line.lower() for x in ["пол-смены", "пол смены", "половина"]):
+                shift_type = "Пол-смены"
+                name = re.sub(r"\s*(пол-смены|пол смены|половина)\s*", "", line,
+                              flags=re.IGNORECASE).strip()
+            if name:
+                e = {"date": current_date, "name": name, "role": role}
+                if role == "Логист":
+                    e["shift_type"] = shift_type
+                results.append(e)
+    return results
+
+@dp.message(S.text_input)
+async def process_text_input(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if text == "❌ Отмена":
+        await cancel(msg, state)
+        return
+
+    data   = await state.get_data()
+    action = data["action"]
+    city   = data["city"]
+
+    try:
+        if action == "florist":
+            entries = parse_schedule(text, "Флорист")
+            if not entries:
+                await msg.answer("❌ Не распознано.")
+                return
+            count = write_schedule(entries, city, "Флорист")
+            dates = sorted({e["date"] for e in entries})
+            names = sorted({e["name"] for e in entries})
+            await msg.answer(
+                f"✅ {count} смен записано!\n📍 {city}\n"
+                f"📅 {dates[0]}—{dates[-1]}\n👤 {', '.join(names)}",
+                reply_markup=main_kb,
+            )
+
+        elif action == "logist":
+            entries = parse_schedule(text, "Логист")
+            if not entries:
+                await msg.answer("❌ Не распознано.")
+                return
+            count = write_schedule(entries, city, "Логист")
+            dates = sorted({e["date"] for e in entries})
+            names = sorted({e["name"] for e in entries})
+            half  = sum(1 for e in entries if e.get("shift_type") == "Пол-смены")
+            extra = f"\n⚡ Пол-смен: {half}" if half else ""
+            await msg.answer(
+                f"✅ {count} смен записано!\n📍 {city}\n"
+                f"📅 {dates[0]}—{dates[-1]}\n👤 {', '.join(names)}{extra}",
+                reply_markup=main_kb,
+            )
+
+        elif action == "marketing":
+            count = 0
+            for line in text.strip().split("\n"):
+                p = line.strip().split()
+                if len(p) < 6:
+                    continue
+                d = p[0]
+                if len(d.split(".")) == 2:
+                    d += f".{datetime.now().year}"
+                try:
+                    write_marketing(d, int(p[1]), int(p[2]),
+                                    float(p[3]), int(p[4]),
+                                    float(p[5].replace(",", ".")), city)
+                    count += 1
+                except Exception:
+                    continue
+            if not count:
+                await msg.answer(
+                    "❌ Формат: `дата план факт $ продаж курс`",
+                    parse_mode="Markdown",
+                )
+                return
+            await msg.answer(f"✅ {count} строк!\n📍 {city}", reply_markup=main_kb)
+
+    except Exception as e:
+        logging.error(f"Error in text_input: {e}", exc_info=True)
+        await msg.answer(f"❌ Ошибка: {e}", reply_markup=main_kb)
+
+    await state.clear()
+
+# ============================================================
+# 🏁  ЗАПУСК
+# ============================================================
 async def main():
-    logging.info("🌸 Flower Dashboard Bot v3.0 starting...")
+    logging.info("🌸 Flower Dashboard Bot v4.0 starting...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
